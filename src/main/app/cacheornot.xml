@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:vm="http://www.mulesoft.org/schema/mule/vm" xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns:tracking="http://www.mulesoft.org/schema/mule/ee/tracking" xmlns:mongo="http://www.mulesoft.org/schema/mule/mongo" xmlns:scripting="http://www.mulesoft.org/schema/mule/scripting" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation" xmlns:spring="http://www.springframework.org/schema/beans" xmlns:core="http://www.mulesoft.org/schema/mule/core" xmlns:json="http://www.mulesoft.org/schema/mule/json" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+xmlns:context="http://www.springframework.org/schema/context" version="EE-3.3.0" xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd 
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd 
+http://www.mulesoft.org/schema/mule/ee/tracking http://www.mulesoft.org/schema/mule/ee/tracking/current/mule-tracking-ee.xsd 
+http://www.mulesoft.org/schema/mule/mongo http://www.mulesoft.org/schema/mule/mongo/2.0/mule-mongo.xsd 
+http://www.mulesoft.org/schema/mule/scripting http://www.mulesoft.org/schema/mule/scripting/current/mule-scripting.xsd 
+http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-current.xsd 
+http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd 
+http://www.mulesoft.org/schema/mule/json http://www.mulesoft.org/schema/mule/json/current/mule-json.xsd 
+http://www.springframework.org/schema/context http://www.springframework.org/schema/context/spring-context-3.0.xsd">
+
+<context:property-placeholder location="classpath:mule-app-default.properties,classpath:mule-app-${env}.properties" />
+
+    <mongo:config name="MongoDB-CloudConnector" host="${mongodb.host}" port="${mongodb.port}" database="${mongodb.database.name}" doc:name="MongoDB-CloudConnector"/>
+    <message-properties-transformer name="text-to-html-msgPropTransformer" doc:name="Message_Properties">
+        <add-message-property key="Content-Type" value="text/html"/>
+    </message-properties-transformer>
+    <catch-exception-strategy name="Default_Exception_Strategy">
+        <logger message="DEFAULT EXCEPTION STRATEGY: #[groovy:message.exceptionPayload]" level="INFO" doc:name="Default Exception Logger"/>
+        <vm:outbound-endpoint exchange-pattern="one-way" path="DLQ.in" doc:name="DLQ"/>
+    </catch-exception-strategy>
+    <configuration defaultExceptionStrategy-ref="Default_Exception_Strategy" doc:name="Configuration"/>
+    <flow name="main" doc:name="main">
+        <http:inbound-endpoint exchange-pattern="request-response" host="${mule.api.host}" port="${mule.api.port}" path="${mule.api.path}" doc:name="HTTP"/>
+        <logger message="QUERY PARAMS: #[headers:INBOUND:*]" level="INFO" doc:name="QRY Params Logger" doc:description="catch cookie if sent to flow"/>
+        <logger message="INBOUND PAYLOAD: #[payload:]" level="INFO" doc:name="Log Inbound Payload"/>
+        <scripting:transformer doc:name="Set Session Props">
+            <scripting:script engine="Groovy">
+                <scripting:text><![CDATA[// ignore the first /
+// and split by / the rest of the message
+msgArr = payload[1..-1].split('/')
+println 'msgArr: ' + msgArr
+
+// msgArr[0] should always contain: 'api'
+if (msgArr[0]=='api') {
+	message.setSessionProperty('API-VALID', true)
+    // Error handling: test that msgArr[n] is not null
+	message.setSessionProperty('API-CLASS', msgArr[1])
+	message.setSessionProperty('API-METHOD', msgArr[2]) 
+	message.setSessionProperty('API-METHOD-ARGS', msgArr[3])
+	// remove /api/ at the front of the message
+	return payload[5..-1]
+}
+else {
+    // this is not a proper api invocation
+	// set FALSE to ISVALID message property
+	message.setSessionProperty('IS-VALID', false)
+	message.setSessionProperty('API-CLASS', null)
+	message.setSessionProperty('API-METHOD', null) 
+	message.setSessionProperty('API-METHOD-ARGS', null)
+    return  payload
+}]]></scripting:text>
+            </scripting:script>
+        </scripting:transformer>
+        <logger message="INBOUND AFTER GROOVY: #[payload:]; API-VALID: #[groovy:message.getSessionProperty('API-VALID')];API-CLASS: #[groovy:message.getSessionProperty('API-CLASS')]; API-METHOD: #[groovy:message.getSessionProperty('API-METHOD')]; API-METHOD-ARGS: #[groovy:message.getSessionProperty('API-METHOD-ARGS')]" level="INFO" doc:name="Confirm Session Props"/>
+        <flow-ref name="testCacheAvailability" doc:name="IsCacheAvailable"/>
+        <choice tracking:enable-default-events="true" doc:name="Choice">
+            <when expression="payload==true">
+                <processor-chain>
+                    <logger message="Data will be retrieved from Cache with args: #[header:session:API-METHOD-ARGS] (transform to JSON...)" level="INFO" doc:name="TRUE"/>
+                    <object-to-string-transformer doc:name="Object to String"/>
+                    <scripting:transformer doc:name="Groovy">
+                        <scripting:script engine="Groovy">
+                            <scripting:text><![CDATA[return "Cache Status: " + payload]]></scripting:text>
+                        </scripting:script>
+                    </scripting:transformer>
+                    <transformer ref="text-to-html-msgPropTransformer" doc:name="Transformer Reference"/>
+                </processor-chain>
+            </when>
+            <otherwise>
+                <processor-chain>
+                    <logger message="Data will be retrieved from Triton with args: #[header:session:API-METHOD-ARGS]" level="INFO" doc:name="FALSE"/>
+                    <object-to-string-transformer doc:name="Object to String"/>
+                    <scripting:transformer doc:name="Groovy">
+                        <scripting:script engine="Groovy">
+                            <scripting:text><![CDATA[return "Cache Status: " + payload]]></scripting:text>
+                        </scripting:script>
+                    </scripting:transformer>
+                    <transformer ref="text-to-html-msgPropTransformer" doc:name="Transformer Reference"/>
+                </processor-chain>
+            </otherwise>
+        </choice>
+    </flow>
+    <flow name="DeadLetterQueue_flow" doc:name="DeadLetterQueue_flow" processingStrategy="asynchronous">
+        <vm:inbound-endpoint exchange-pattern="one-way" path="DLQ.in" responseTimeout="10000" mimeType="text/plain" doc:name="VM"/>
+        <logger message="DEAD LETTER: #[payload:]" level="INFO" doc:name="Logger"/>
+    </flow>
+    <flow name="testCacheAvailability" doc:name="testCacheAvailability">
+        <mongo:find-objects-using-query-map config-ref="MongoDB-CloudConnector" collection="${mongodb.cache.collection.name}" username="${mongodb.username}" password="${mongodb.password}" doc:name="Mongo DB">
+            <mongo:query-attributes>
+                <mongo:query-attribute key="${mongodb.cache.check.key}">${mongodb.cache.check.value}</mongo:query-attribute>
+            </mongo:query-attributes>
+        </mongo:find-objects-using-query-map>
+        <choice doc:name="Choice">
+            <when expression="payload.iterator().hasNext()">
+                <processor-chain>
+                    <logger message="Cache content is valid and returns one or more object from 'availability' collection" level="INFO" doc:name="Logger"/>
+                    <expression-transformer evaluator="groovy" expression="true" doc:name="Expression"/>
+                </processor-chain>
+            </when>
+            <otherwise>
+                <processor-chain>
+                    <logger message="Cache content invalid. Unknown or empty 'availability' collection" level="INFO" doc:name="Logger"/>
+                    <expression-transformer evaluator="groovy" expression="false" doc:name="Expression"/>
+                </processor-chain>
+            </otherwise>
+        </choice>
+        <logger message="In flow testCacheAvailability: Is Cache Available: #[payload:]" level="INFO" doc:name="true/false Logger"/>
+        <catch-exception-strategy doc:name="Catch Exception Strategy">
+            <logger message="Could not connect to MongoDB" level="INFO" doc:name="Logger"/>
+            <expression-transformer evaluator="groovy" expression="false" doc:name="FALSE"/>
+        </catch-exception-strategy>
+    </flow>
+</mule>
